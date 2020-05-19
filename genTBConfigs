@@ -1,0 +1,301 @@
+#!/bin/bash
+# Usage: genTBConfigs [-csv <yamlFile>] [-gen] [-lab]
+#
+# Creates configuration files needed for a flexibed. 
+# 1. If -csv is given, then yamlfile is a csv file with config values corresponding to 'headings' 
+#    as declared below. 
+# 2. If -csv is NOT given, then we assume that there is a pre-existing config.yaml file and use it
+# 
+# In both cases, the script will call generate_flexibeds.py located in global/tools/flexibed_generator. That script requires 
+# a config.yaml file and a labfile.txt file. The config.yaml file can either be pre-existing, or can be created from a csv
+# file passed to the -csv option. 
+# 
+# The labfile can either be pre-existing, or if given the -lab switch, will be created from <locale><bedtype>.txt file.
+# Once generate_flexibeds.py has run, the generated config files are copied to the 5 various repos that need to be updated:
+#
+#   global, pxe-configs, gash, infra, and puppet
+#
+# These repos are assumed to be located in ~/ws, but that can be overridden by setting the REPOSHOME variable
+#
+
+#--- Globals ---
+GenConfig=false
+GenLabfile=false
+GenYaml=false
+declare locale bednum bedtype regressParams
+declare yamlFile
+declare headings=('bed name' public_ip sim_ip sim_bootip ipmi_ip UID
+                   subnet_mask gateway last_mac vm_num
+                   ixia_server ixia_slot ixia_port)
+declare -A yaml
+
+# -- Utilities --
+function genInfraTCLFile() {
+    local tb=$1
+    local tclfile=infra/${tb}.tcl
+    mkdir -p infra
+    rm -f $tclfile
+    cat > $tclfile <<-EOF
+	setGlobalVar regressionTestBed true
+	setGlobalVar virtualPorts true
+	setGlobalVar bofaSupport true
+	setGlobalVar virtualLinux true
+	setGlobalVar flexibedSupport true
+	setGlobalVar ixNetworkSupport false
+	EOF
+     [ -n "${yaml['ixia_server']}" ] && {
+	cat >> $tclfile <<-EOF
+	setGlobalVar ixNetworkVersion 8.40.1124.8
+	EOF
+        }
+     cat >> $tclfile <<-EOF
+	setGlobalVar sharedFabricSupport true
+	setGlobalVar jmeterSupport true
+	setGlobalVar mvNsgDev true
+
+	global ixChassisIp ixTclServerIp ixTclServerPort
+	EOF
+     [ -n "${yaml['ixia_server']}" ] && {
+	cat >> $tclfile <<-EOF
+	set ixChassisIp ${yaml['ixia_server']}
+	EOF
+        }
+     cat >> $tclfile <<-EOF
+	#Ixia Password 701783
+
+	global unixhost unixdev
+
+	set unixhost "1 2 3 4"
+	set unixdev eth
+
+	EOF
+     [ -n "${yaml['ixia_server']}" ] && {
+	cat >> $tclfile <<-EOF
+	setGlobalVar ixVersion 8.40
+	lappend ::TestTopo::ixiaChassisList "1 \$ixChassisIp"
+	#lappend ::TestTopo::ixiaTclServer "\$ixTclServerIp \$ixTclServerPort"
+	lappend ::TestTopo::ixiaPortList "1 ${yaml['ixia_slot']} ${yaml['ixia_port']}"
+	lappend ::TestTopo::ixiaPortList "1 ${yaml['ixia_slot']} $((${yaml['ixia_port']}+1))"
+	lappend ::TestTopo::ixiaPortList "1 ${yaml['ixia_slot']} $((${yaml['ixia_port']}+2))"
+	lappend ::TestTopo::ixiaPortList "1 ${yaml['ixia_slot']} $((${yaml['ixia_port']}+3))"
+
+	EOF
+        }
+     cat >> $tclfile <<-EOF
+	if {[getGlobalVar debugConstraint] == "false" && [file exists "~/images/esrcalls.tcl"]} {
+	    source "~/images/esrcalls.tcl"
+	} else {
+	    log_msg DEBUG "No call to 'esrcalls.tcl' made, proceeding..."
+	}
+	EOF
+    [ -f $tclfile ] || {
+	echo ERROR: Failed to create $tclfile
+	return 1
+	}
+}
+
+function genLabFile() {
+    local tb=$1
+    cat ${locale}${bedtype}.txt | \
+        awk "/$tb/ {print; getline; while (index(\$0, \"$locale\") == 0) {print; if (getline == 0) { exit; }; } }" > \
+        labfiles/${tb}.txt
+    ls labfiles/${tb}.txt
+    }
+
+function genConfigYaml() {
+    local tb=$1
+    cat >config.yaml <<-EOF
+	# config.yaml file 
+	lab_file: ./$tb-labfile.txt 
+	sim_ip: ${yaml['sim_ip']}
+	running_ip: ${yaml['sim_bootip']}
+	ipmi_ip: ${yaml['ipmi_ip']}
+	last_mac: ${yaml['last_mac']}
+	vm_num: ${yaml['vm_num']}
+	user_id: ${yaml['UID']}
+	site_name: ${locale}
+	user_global: ./myglobal
+	site_dns: 135.227.24.250
+	netmask: ${yaml['subnet_mask']}
+	git_gash:${yaml['git_gash']}
+	git_pxe:${yaml['git_pxe']}
+	git_puppet:${yaml['git_puppet']}
+	default_gateway: ${yaml['gateway']}
+	public_ip: ${yaml['public_ip']}
+
+EOF
+}
+
+function genLocalLabfile() {
+    local tb=$1
+    local sim_bootip=$(grep running_ip config.yaml | awk '{print $NF;}')
+    cat >labfile.header <<-EOF
+
+	IPMI                    ETH0
+	----                    ----
+	${tb}:${sim_bootip}
+EOF
+    cat labfile.header ${tb}.txt > ${tb}-labfile.txt
+}
+
+function updateDatafile() {
+    local tb=$1
+    local datafile=$2
+    [ -f $datafile ] || { echo $datafile not found; return 1; }
+    grep -q -w $tb $datafile && { 
+    	echo WARNING: $tb already found in $datafile;
+	return 1;
+    }
+    if [[ $tb =~ dcdev18 ]]; then
+	    lastentry=$(cat $datafile | grep ${locale}dcdev18 | tail -1)
+    else
+	    lastentry=$(cat $datafile | grep ${locale}${bedtype} | grep -v dcdev18 | tail -1)
+    fi
+    [ -z "$lastentry" ] && {
+        echo WARNING: could not create $tb entry in $datafile; 
+        echo WARNING: Will need to do this by hand
+        return 1
+        }
+    lastbed=$(echo "$lastentry" | sed "s,^.*\(${locale}[[:alnum:]]*\).*,\1,")
+    newentry=$(echo "$lastentry" | sed "s,$lastbed,$tb,")
+    sed -i "s,$lastentry,$lastentry\n$newentry," $datafile 
+    grep $tb $datafile
+    }
+
+function updateRegressParams() {
+    local tb=$1
+    local datafile=${REPOSHOME:-~/ws}/global/bin/regress.params
+    local newentry=''
+    [ -f $datafile ] || { echo $datafile not found; return 1; }
+    grep -q -w $tb $datafile && { 
+    	echo WARNING: $tb already found in $datafile;
+	return 1;
+    }
+    if [[ $tb =~ dcdev18 ]]; then
+	    lastentry=$(cat $datafile | grep ${locale}dcdev18 | tail -1)
+    else
+	    lastentry=$(cat $datafile | grep ${locale}${bedtype} | grep -v dcdev18 | tail -1)
+    fi
+    [ -z "$lastentry" ] && {
+        echo WARNING: could not create $tb entry in $datafile; 
+        echo WARNING: Will need to do this by hand
+        return 1
+        }
+# Here we need to get the regress.params output of generate_flexibeds
+    
+    IFS=$'\n' && for i in $(python ${REPOSHOME:-~/ws}/global/tools/flexibed_generator/generate_flexibed_files.py \
+               --regress-params --config-file ./config.yaml)
+    do
+        newentry="${newentry}$i::"
+    done
+    sed -i "s#$lastentry#$lastentry\n\n${newentry%::}#" $datafile 
+    sed -i 's/::/\n/g' $datafile
+    grep $tb $datafile
+    }
+
+function genConfigFiles() {
+    local tb=$1
+    mkdir -p $tb
+    [ -d "$tb" ] || {
+      echo ERROR: Failed to mkdir $tb
+      exit 1
+      }
+    cd $tb || {
+      echo ERROR: Failed to cd to $tb
+      exit 1
+    }
+    [[ "$(basename $(pwd))" = "$tb" ]] || {
+      echo "not in $tb directory; exiting"
+      exit 1;
+      }
+    cp -r ../samplebed/. .
+    cp ../labfiles/${tb}.txt .
+    genLocalLabfile ${tb}
+    [ "$GenYaml" = true ] && { genConfigYaml ${tb} || exit 1; }
+    rm -rf global gash puppet pxe-configs infra
+    genInfraTCLFile ${tb}
+    updateRegressParams ${tb}
+    python ${REPOSHOME:-~/ws}/global/tools/flexibed_generator/generate_flexibed_files.py --config-file ./config.yaml
+    cp -rv global/$tb/ ${REPOSHOME:-~/ws}/global/data/testbed/
+    cp -rv gash/$tb/ ${REPOSHOME:-~/ws}/gash/configs/
+    cp -rv puppet/. ${REPOSHOME:-~/ws}/puppet/hieradata/node
+    cp -rv pxe-configs/$tb/nvrams/. ${REPOSHOME:-~/ws}/pxe-configs/wfnupxe1/nvrams/
+    cp -rv pxe-configs/$tb/*.dhcpd.conf ${REPOSHOME:-~/ws}/pxe-configs/wfnupxe1/dhcpd.conf.d/
+    cp -rv infra/${tb}.tcl ${REPOSHOME:-~/ws}/infra/bin/testbed/
+    case $locale in
+        wf) updateDatafile $tb ${REPOSHOME:-~/ws}/global/data/regression/testbed_lists/powercycle.data;
+	    updateDatafile $tb ${REPOSHOME:-~/ws}/pxe-configs/wfnupxe1/dhcpd.conf;
+	    ;;
+	 *) echo WARNING: unknown locale $locale. Will have to update powercycle.data and dhcpd.conf manually
+    esac
+}
+# ---------------
+function usage() { cat <<EOF
+usage $(basename $0) [-lab] [-gen <yaml file>] [-csv <csv file>] [<testbed name>] 
+  -lab: create labfiles/<testbed name>.txt from wfxxx.txt
+  -gen: generate flexibed config files using labfiles/<testbed name>.txt and
+        csv formatted <yaml file>
+  -csv: get config values, including bed name, from <csv file>. Must be in csv format
+EOF
+}
+
+function main() {
+    local tb=$1
+    [[ "$tb" =~ nsgdev|dcdev ]] || {
+      usage
+      return 1
+      }
+
+    locale=$(echo $tb | sed 's/^\(..\).*/\1/')
+    case $locale in
+      wf) bednum=$(echo $tb | sed 's/^wfnsgdev\|wfdcdev\(.*\)/\1/')
+          bedtype=$(echo $tb | sed "s/^wf\(.*\)$bednum/\1/")
+          ;;
+      *) echo cannot determine locale && return 1;;
+    esac
+    [ $GenLabfile = true ] && genLabFile $tb
+    [ $GenConfig = true ] && genConfigFiles $tb
+    }
+
+# ------------------------------------------------------------------------------
+optstring='csv:,lab,labfile,gen,genonly'
+getopt -Q -a -o "" --longoptions $optstring -- "$@"
+[ $? -eq 0 ] || { usage; exit 1; }
+
+eval set -- $(getopt -a -o "" --longoptions $optstring -- "$@")
+while [[ $1 != -- ]]
+do
+  case "$1" in
+       --gen|-genonly)  GenConfig=true;  shift;;
+       --lab|--labfile) GenLabfile=true; shift;;
+       --csv)           GenYaml=true; yamlFile=$(readlink -e ${2}); shift 2;;
+            *) break ;;
+        esac
+done
+[ $1 = -- ] && shift
+
+[ -n "$1" ] && tb=$1
+
+declare -a config
+if [ $GenYaml = true ]
+	# we don't have a config.yaml file. Read config values from the 
+	# csv file passed on the command line and generate one
+then
+    [ -f $yamlFile ] || { usage; exit 1; }
+    while IFS=, read -a config
+    do
+       unset yaml; declare -A yaml
+       for ((i=0; i < ${#config[@]}; i++))
+       do
+          yaml[${headings[$i]}]=${config[$i]}
+       done
+       ( main ${yaml['bed name']} )
+       unset config; declare -a config
+    done <${yamlFile}
+else
+        # we are not generating a new config.yaml file. Just create 
+        # config files using a pre-existing config.yaml file
+    tb=$1
+    [ -n "$tb" ] || { usage; exit 1; }
+    ( main $tb )
+fi
