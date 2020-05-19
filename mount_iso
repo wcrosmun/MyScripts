@@ -1,0 +1,288 @@
+#!/bin/bash
+# vim: nohls bg=dark et sw=4 ts=4 ai
+set -x
+set -e
+
+trap cleanup ERR
+declare centos7 squashfs ext3fs newiso
+declare do_cleanup=0 do_create_newiso=1 do_install=1
+declare do_createbase=0 do_erase=0
+declare iso_image=centos7-base.iso out_image=$(pwd)/centos7.iso
+declare nsg_version=$BUILD_BRANCH vsd_version=$VSD_API_VERSION
+declare PKGSBUILT=${PKGSBUILT:=pkgsbuilt.list}
+
+function cleanup() {
+    for i in $(egrep -o "/tmp[^ ]*" /proc/mounts); do 
+        umount -l ${i/\\*} && rm -rf ${i/\\*}
+    done 
+    rm -rf /tmp/centos7*
+    rm -rf /tmp/squashfs*
+    rm -rf /tmp/ext3fs*
+    rm -rf /tmp/newiso*
+}
+
+function create_chroot() {
+    centos7=$(mktemp -d /tmp/centos7.XXXX)
+    mount -t iso9660 -o ro,loop $iso_image $centos7
+    squashfs=$(mktemp -d /tmp/squashfs.XXXX)
+    mount -o squashfs $centos7/LiveOS/squashfs.img $squashfs
+    ext3fs=$(mktemp -d /tmp/ext3fs.XXXX)
+    mount $squashfs/LiveOS/ext3fs.img $ext3fs
+    newiso=$(mktemp -d /tmp/newiso.XXXX)
+    (cd $ext3fs && tar cf - . | (cd $newiso; tar xfp -))
+    echo $newiso
+}
+
+function create_bindmounts() {
+    mkdir -p $newiso/tmp/pkgs
+    mount -o bind $(pwd)/pkgs $newiso/tmp/pkgs
+    mount -o bind /var/run $newiso/var/run
+    mount -o bind /sys $newiso/sys
+    mount -o bind /dev $newiso/dev
+    mount -o bind /proc $newiso/proc
+}
+
+function create_etcresolv() {
+    mv $newiso/etc/resolv.conf $newiso/etc/resolv.conf.sav
+    cp /etc/resolv.conf $newiso/etc/resolv.conf
+}
+
+function save_installdirs() {
+# return dirs in var to <dir>_at_install
+for i in cache spool cfengine log lib
+do
+    if [ -d $newiso/var/${i} ]; then
+        mv $newiso/var/${i} $newiso/var/${i}dir_at_install
+    fi
+    if [ -d $newiso/var/${i}.save ]; then
+        mv $newiso/var/${i}.save $newiso/var/${i}
+    fi
+done
+# Move /var/lib/rpm directory to accomodate tmpfs mount
+#mv -f $newiso/var/lib/rpm $newiso/var/libdir_at_install
+}
+
+function restore_installdirs() {
+# mv var/*dir_at_install back the way they were
+# when the base iso file was first created
+#if [ -d $newiso/var/libdir_at_install/rpm ]; 
+#then
+    #mv $newiso/var/libdir_at_install/rpm $newiso/var/lib/rpm
+#fi
+for i in cache spool cfengine log lib
+do
+    if [ -d $newiso/var/$i ]; then
+        mv $newiso/var/$i $newiso/var/${i}.save
+    fi
+    if [ -d $newiso/var/${i}dir_at_install ]; then
+        mv $newiso/var/${i}dir_at_install $newiso/var/${i}
+    fi
+done
+}
+
+function create_localrepo() {
+cat << EOF > $newiso/etc/yum.repos.d/local.repo
+[local]
+name=Local Repository
+baseurl=file:///tmp/pkgs/
+enabled=1
+priority=1
+gpgcheck=0
+EOF
+}
+
+function prep_for_newiso() {
+    for i in $(grep $newiso /proc/mounts | awk '{print $2;}')
+    do
+        umount -l $i
+    done
+    save_installdirs
+    mv $newiso/etc/resolv.conf.sav $newiso/etc/resolv.conf
+    find $newiso/etc/yum.repos.d -name '*.repo' ! -path "$newiso/etc/yum.repos.d/nsg*.repo" -delete
+    rm -f $newiso/var/lib/rpm/__db*
+}
+
+function make_base() {
+    local packages='kmod-nuage-openvswitch nuage-openvswitch nuage-nsg nuage-dpdk'
+    chroot $newiso yum erase -y $packages
+
+    if [ -f $PKGSBUILT ]; then
+        pkgsbuilt=($(cat $PKGSBUILT))
+    else
+        pkgsbuilt=($(cat cake.json | jq -r '.targets[].name'))
+    fi
+
+    for package in ${pkgsbuilt[@]}
+    do
+        output=$(jq -r ".targets[]|select(.name == \"$package\").output" cake.json)
+        for artifact in $(jq -r ".targets[]|select(.name == \"$package\").artifacts[]" cake.json)
+        do
+            pkg=$(basename $(ls $output/$artifact) | sed -r 's/-[0-9].*(x86_64|noarch|i686)/.\1/')
+            chroot $newiso rpm -e --nodeps ${pkg/.rpm/} || true
+        done
+    done
+
+    if [ $do_install -eq 1 ]
+    then
+        for package in ${pkgsbuilt[@]}
+        do
+            output=$(jq -r ".targets[]|select(.name == \"$package\").output" cake.json)
+            for artifact in $(jq -r ".targets[]|select(.name == \"$package\").artifacts[]" cake.json)
+            do
+                pkg=$(basename $(ls $output/$artifact))
+                chroot $newiso rpm -Uvv --noscripts --excludedocs -p /tmp/$output/${pkg} || true
+            done
+        done
+        tar -C $newiso/pkgs/intel_qat -p -xf pkgs/intel_qat/intel_qat.tar
+        cp -v pkgs/NuageBaseContainer.tar.gz $newiso/opt/SDVPNAgent/lxc
+        chroot $newiso yum install -y $packages
+    fi
+}
+
+function create_iso_file() {
+    mkdir -p /tmp/squashfs/LiveOS
+    mksquashfs $newiso /tmp/squashfs/LiveOS/ext3fs.img -noappend 
+    mkdir -p /tmp/centos7
+    rsync -arv --exclude=squashfs.img $centos7/ /tmp/centos7
+    mksquashfs /tmp/squashfs /tmp/centos7/LiveOS/squashfs.img -noappend
+}
+
+function gen_isoimage() {
+    out_image="$(pwd)/$(basename $out_image)"
+    cd /tmp/centos7
+    genisoimage -r -V centos7 -cache-inodes -J -allow-limited-size -udf \
+        -b isolinux/isolinux.bin -c isolinux/boot.cat -no-emul-boot \
+        -boot-load-size 4 -boot-info-table -A centos7 -o $out_image \
+        .
+    implantisomd5 $out_image
+}
+# This function edits the 'nsgsetup' file to have the variable KERNELNOSECPSWDCRYPT
+# filled with crypted password.
+# Usage: <function> <plain-text-password> <salt used for SHA512 encryption>
+function update_password_entry_nsgsetup() {
+    PSWD="$1" SALT="\$6\$$2" PREFIX="KERNELNOSECPSWDCRYPT=" FILEPATH="$newiso/etc/rc.d/init.d/nsgsetup" python - <<ENDPYTHON
+import crypt
+import os
+fin = open(os.environ['FILEPATH'], "r")
+lines = fin.readlines()
+fin.close()
+
+fout = open(os.environ['FILEPATH'], "w")
+for line in lines:
+    if os.environ['PREFIX'] in line:
+        fout.write(os.environ['PREFIX']+"'"+crypt.crypt(os.environ['PSWD'], os.environ['SALT'])+"'"+'\n')
+    else:
+        fout.write(line)
+fout.close()
+ENDPYTHON
+}
+
+
+function post_from_ks() {
+# run commands from the %post in centos7.ks that are still
+# needed
+# Copy custom drivers if they exist
+# Environment variables used
+# KERNELNOSECPSWDxxx are secret security option related that disables NSG security if passed
+KERNELNOSECPSWDOPT='nosecurensgpw'
+KERNELNOSECPSWDPLAIN='Ip4HyuwU6Q'
+
+    rm -rf $newiso/var/lib/rpm/__db*
+    chroot $newiso rpm -qa | sort
+    rm -rf $newiso/var/lib/rpm/__db*
+    # Copy KERNELNOSECPSWDOPT defined here to nsgsetup file
+    sed -i "s/^KERNELNOSECPSWDOPT=.*/KERNELNOSECPSWDOPT='$KERNELNOSECPSWDOPT'/" $newiso/etc/rc.d/init.d/nsgsetup
+    # Fill in encrypted value of password allowing NSG to disable security on demand
+    update_password_entry_nsgsetup $KERNELNOSECPSWDPLAIN nuagensgsalt20xx
+    rm -rf $newiso/usr/share/doc
+    rm -rf $newiso/usr/share/man
+    echo "Nuage NSG $nsg_version" > $newiso/etc/redhat-release
+    echo "$vsd_version" > $newiso/etc/nuage-api-version
+
+}
+
+function create_base() {
+    do_install=0
+    jq -r '.targets[].name' cake.json.template > $PKGSBUILT
+    out_image=${out_image:-centos7-base.iso}
+    create_new_iso
+}
+
+function create_new_iso() {
+    make_base 
+    prep_for_newiso
+    post_from_ks
+    create_iso_file
+    gen_isoimage
+}
+
+#---- main ----
+
+#--- process options ----
+optstring=help,cleanup,erase,image:,noinstall,kernelversion:,makebase,mount:,output:,version:,vsd_version:
+function usage() { cat << EOF
+usage $(basename $0) [-help] [-cleanup] [-mount <image>] [-image <iso file>]
+                     [-noinstall] [-output <iso file>] [-makebase]
+    help        :  Show this help message.
+    cleanup     :  Umount and remove temporary directories.
+    erase       :  erase packages before install
+    mount       :  Do not create a new iso image, just setup mounts for <image>. 
+                   /tmp/newiso.XXXX will be a chroot'able directory.
+    noinstall   : Do not install packages. Default is to install all packages.
+    image       :  Use 'iso file' rather than centos7.iso.
+    output      :  Full path to iso file to create. Default is centos7.iso.
+    version     :  value for nsg_version
+    vsd_version :  value of VSD_API_VERSION
+    makebase    :  Make iso file with all packages removed. Default to centos7-base.iso.
+EOF
+}
+
+function main() {
+    getopt -Q -a -o "" --longoptions $optstring -- "$@"
+    [ $? -eq 0 ] || { usage; exit 1; }
+    eval set -- $(getopt -a -o "" --longoptions $optstring -- "$@")
+    while [[ $1 != -- ]]
+    do
+        case "$1" in
+            --help   )   usage; exit 0;;
+            --cleanup)     do_cleanup=1; shift;;
+            --erase  )     do_erase=1; shift;;
+            --image  )     iso_image=$2; shift 2;;
+            --kernelversion) shift 2;;
+            --mount  )     do_create_newiso=0; iso_image=$2; shift 2;;
+            --noinstall)   do_install=0; shift;;
+            --makebase)    do_createbase=1; shift;;
+            --output )     out_image=$2; shift 2;;
+            --version)     nsg_version=$2; shift 2;;
+            --vsd_version) vsd_version=$2; shift 2;;
+            *) break ;;
+        esac
+    done
+    [ "$1" = -- ] && shift
+
+    [[ "$1" =~ clean ]] && do_cleanup=1
+
+    [ $do_cleanup -eq 1 ] && {
+        cleanup
+        exit
+        }
+
+    cleanup # delete remnants of previous runs
+    create_chroot # explode $iso_image, create chrootable $newiso
+    create_etcresolv # copy /etc/resolv to chroot
+    create_localrepo # create /etc/yum.repos.d/local.repo, setup var/lib for yum
+    restore_installdirs # mv {lib,log,cache,cfengine,spool}dir_at_install back into /var
+    create_bindmounts # bind mount /proc, /sys, etc
+    echo chroot $newiso
+    if [ $do_createbase -eq 1 ]
+    then
+        create_base #  create iso file with all nsg packages removed
+    elif [ $do_create_newiso -eq 1 ]
+    then
+        create_new_iso # install/uninstall packages and create $out_image
+        cleanup
+    else
+        chroot $newiso # just chroot to $newiso
+    fi
+}
+time main "$@"
